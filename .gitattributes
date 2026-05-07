@@ -1,0 +1,8 @@
+# Force LF line endings for shell scripts and text files.
+# Это защищает от CRLF, который может появиться при клонировании/скачивании
+# на Windows и ломает bash (`$'\r': command not found`, `syntax error`).
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.md        text eol=lf
+*.json      text eol=lf
+.gitattributes text eol=lf

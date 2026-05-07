@@ -50,6 +50,18 @@ sudo ./vpn-manager.sh
 При первом запуске будут установлены недостающие зависимости (`jq`, `openssl`,
 `curl`, `qrencode`, `xray-core`).
 
+> ⚠️ **Если скачивали файл через Windows / браузер**, сначала уберите CRLF:
+>
+> ```bash
+> sed -i 's/\r$//' vpn-manager.sh
+> # или
+> apt-get install -y dos2unix && dos2unix vpn-manager.sh
+> ```
+>
+> Иначе bash выдаст ошибки вида `$'\r': command not found` и
+> `syntax error near unexpected token`. При `git clone` репозитория проблемы
+> нет — `.gitattributes` форсит LF.
+
 Можно использовать и в неинтерактивном виде:
 
 ```bash
