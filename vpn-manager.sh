@@ -283,12 +283,13 @@ prompt() {
 
 choose() {
     # choose "Заголовок" "опция1" "опция2" ...
+    # ВАЖНО: весь UI идёт в stderr, чтобы не попасть в $(choose ...).
     local title="$1"; shift
     local options=("$@")
     local i n=${#options[@]}
-    printf '\n%b%s%b\n' "${C_BOLD}" "${title}" "${C_RESET}"
+    printf '\n%b%s%b\n' "${C_BOLD}" "${title}" "${C_RESET}" >&2
     for (( i=0; i<n; i++ )); do
-        printf '  %b%d)%b %s\n' "${C_CYAN}" "$((i+1))" "${C_RESET}" "${options[i]}"
+        printf '  %b%d)%b %s\n' "${C_CYAN}" "$((i+1))" "${C_RESET}" "${options[i]}" >&2
     done
     local pick
     while :; do
