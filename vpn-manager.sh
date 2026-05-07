@@ -303,6 +303,22 @@ mode_dest_for() {
     esac
 }
 
+mode_description() {
+    case "$1" in
+        default)
+            printf 'Обычный туннель через VPS без доп. обвязки.' ;;
+        encrypted)
+            printf 'VLESS+REALITY: провайдер не видит реальный URL/IP.' ;;
+        whitelist_bypass)
+            printf 'REALITY со SNI разрешённого ресурса (vk.com).' ;;
+        fake_tls)
+            printf 'REALITY+Vision под легитимный HTTPS-сайт (DPI обход).' ;;
+        mega_crypt)
+            printf 'REALITY+Vision с удлинённым short_id (8 байт) и премиальным внешним SNI.' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 mode_sni_for() {
     local mode="$1"
     mode_dest_for "${mode}" | cut -d: -f1
@@ -653,12 +669,10 @@ cmd_create() {
             entry="$(jq --arg p "${pwd}" '.password=$p' <<<"${entry}")"
             ;;
         shadowsocks)
-            local pwd; pwd="$(random_password)"
-            entry="$(jq --arg p "${pwd}" --arg m "2022-blake3-aes-256-gcm" \
-                '.password=$p | .method=$m' <<<"${entry}")"
-            # SS-2022 требует 32-байтный ключ в base64
+            # SS-2022 требует 32-байтный ключ в base64.
             local key; key="$(openssl rand -base64 32 | tr -d '\n')"
-            entry="$(jq --arg p "${key}" '.password=$p' <<<"${entry}")"
+            entry="$(jq --arg p "${key}" --arg m "2022-blake3-aes-256-gcm" \
+                '.password=$p | .method=$m' <<<"${entry}")"
             ;;
     esac
 
@@ -672,7 +686,13 @@ cmd_create() {
         kp="$(reality_keypair)"
         priv="${kp% *}"
         pub="${kp#* }"
-        sid="$(short_id_hex)"
+        # Mega Crypt использует удлинённый short_id (8 байт) для меньшей коллизии
+        # и премиальный внешний SNI; остальные режимы — стандартный 4-байтный.
+        if [[ "${mode}" == "mega_crypt" ]]; then
+            sid="$(openssl rand -hex 8)"
+        else
+            sid="$(short_id_hex)"
+        fi
         sni="$(mode_sni_for "${mode}")"
         dest="$(mode_dest_for "${mode}")"
         entry="$(jq --arg priv "${priv}" --arg pub "${pub}" --arg sid "${sid}" \
@@ -814,10 +834,20 @@ cmd_connections() {
         # Считаем уникальные клиентские IP за последние 5 минут по тэгу инбаунда.
         cnt=0
         if [[ -s "${XRAY_ACCESS_LOG}" ]]; then
-            cnt="$(awk -v tag="${tag}" -v since="$(date -d '5 min ago' '+%Y/%m/%d %H:%M:%S' 2>/dev/null)" '
-                $0 ~ tag && $0 ~ /accepted/ {
-                    # формат: 2024/01/01 12:00:00 from 1.2.3.4:5678 accepted ...
-                    for (i=1;i<=NF;i++) if ($i=="from") { ip=$(i+1); sub(/:.*/,"",ip); ips[ip]=1 }
+            local since
+            since="$(date -d '5 min ago' '+%Y/%m/%d %H:%M:%S' 2>/dev/null || true)"
+            cnt="$(awk -v tag="${tag}" -v since="${since}" '
+                # Формат строки Xray:
+                #   2024/01/01 12:00:00 from 1.2.3.4:5678 accepted tcp:host:443 [tag] email:
+                # Сравнение времени работает лексикографически из-за формата YYYY/MM/DD HH:MM:SS.
+                {
+                    ts = $1 " " $2
+                    if (since != "" && ts < since) next
+                    if (index($0, tag) == 0) next
+                    if (index($0, "accepted") == 0) next
+                    for (i=1;i<=NF;i++) if ($i=="from") {
+                        ip = $(i+1); sub(/:.*/,"",ip); ips[ip]=1
+                    }
                 }
                 END { n=0; for (k in ips) n++; print n }' "${XRAY_ACCESS_LOG}")"
         fi
@@ -849,16 +879,20 @@ human_bytes() {
 xray_stat() {
     # xray_stat <name> [reset]
     local name="$1" reset="${2:-false}"
-    local out
+    local out=""
     if ! command -v xray >/dev/null 2>&1; then
         printf '0'; return
     fi
+    # Пробуем современный (--server / -name) и старый (-server / -name=) формат флагов Xray.
     out="$(xray api stats --server="127.0.0.1:${XRAY_API_PORT}" -name "${name}" -reset="${reset}" 2>/dev/null || true)"
+    if [[ -z "${out}" ]]; then
+        out="$(xray api stats -server="127.0.0.1:${XRAY_API_PORT}" -name="${name}" -reset="${reset}" 2>/dev/null || true)"
+    fi
     if [[ -z "${out}" ]]; then
         printf '0'
         return
     fi
-    # ответ JSON: {"stat":{"name":"...", "value":"123"}}
+    # Ответ JSON: {"stat":{"name":"...", "value":"123"}}.
     jq -r '.stat.value // "0"' <<<"${out}" 2>/dev/null || printf '0'
 }
 
