@@ -13,12 +13,23 @@
 #   - Encrypted     : VLESS+REALITY (DPI не видит реальный URL/SNI)
 #   - White-List    : REALITY со SNI разрешённого ресурса (vk.com и т.п.)
 #   - Fake TLS      : REALITY+Vision под реальный HTTPS-сайт
-#   - Mega crypt    : REALITY+Vision поверх WebSocket+TLS (максимальная маскировка)
+#   - Mega crypt    : REALITY+Vision с удлинённым short_id и премиальным внешним SNI
 #
 # Поддерживаемые протоколы: vless, trojan, xray (vless+xtls-vision), shadowsocks
 #
 # Зависимости: bash >=4, jq, openssl, curl, qrencode (опц.), xray-core
 # Скрипт автоматически устанавливает недостающие зависимости через apt.
+
+# --- POSIX-совместимый ре-exec под bash, если скрипт запущен через sh/dash. -------
+# Должен быть ПЕРВЫМ исполняемым кодом в файле и не содержать bash-специфичного синтаксиса.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    else
+        printf '%s\n' "Ошибка: требуется bash. Установите его: apt-get install -y bash" >&2
+        exit 1
+    fi
+fi
 
 set -Eeuo pipefail
 
