@@ -34,6 +34,27 @@
 | `Trojan`       | Trojan over TCP (+ REALITY в режимах ≠ Default) |
 | `Xray`         | VLESS + `xtls-rprx-vision` |
 | `Shadowsocks`  | Shadowsocks-2022 (`2022-blake3-aes-256-gcm`) |
+| `AmneziaWG`    | WireGuard с обфускацией (Junk-пакеты + кастомные заголовки) — обход белых списков мобильных операторов |
+
+### AmneziaWG — обход белых списков
+
+При выборе протокола `AmneziaWG` остальные шаги (режим маскировки, Solo/Merge)
+пропускаются — это отдельный стек поверх WireGuard. Скрипт:
+
+* устанавливает `amneziawg`/`amneziawg-tools`/`amneziawg-dkms` из официального
+  PPA (Ubuntu/Debian);
+* инициализирует один раз сервер (`/etc/amnezia/amneziawg/awg0.conf`,
+  `awg-quick@awg0.service`, форвардинг `net.ipv4.ip_forward=1`, NAT через
+  iptables MASQUERADE);
+* для каждого клиента генерирует ключи + PSK + IP `10.66.66.X`, добавляет
+  `[Peer]` в server-конфиг и кладёт готовый `.conf` в
+  `/etc/vpn-manager/clients/<id>.conf` плюс QR в терминал;
+* парсит `awg show awg0 latest-handshakes` / `transfer` для команд
+  `connections` и `traffic`.
+
+**Импорт в клиент:** AmneziaWG несовместим с Happ — используйте клиент
+[AmneziaVPN](https://amnezia.org/) и импортируйте `.conf` или QR-код.
+Не забудьте открыть на сервере UDP-порт, который скрипт укажет в выводе.
 
 ### Solo / Merge
 

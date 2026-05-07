@@ -49,6 +49,15 @@ readonly XRAY_ACCESS_LOG="${XRAY_LOG_DIR}/access.log"
 readonly XRAY_API_TAG="api"
 readonly XRAY_API_PORT=10085
 
+# AmneziaWG (отдельный стек, не Xray)
+readonly AWG_CONF_DIR="/etc/amnezia/amneziawg"
+readonly AWG_IFACE="awg0"
+readonly AWG_CONF_FILE="${AWG_CONF_DIR}/${AWG_IFACE}.conf"
+readonly AWG_STATE_FILE="${STATE_DIR}/awg-server.json"
+readonly AWG_CLIENTS_DIR="${STATE_DIR}/clients"
+readonly AWG_SUBNET_PREFIX="10.66.66"
+readonly AWG_SERVER_IP="${AWG_SUBNET_PREFIX}.1"
+
 # Цвета (только для tty)
 if [[ -t 1 ]]; then
     readonly C_RED=$'\033[31m'
@@ -134,6 +143,7 @@ ensure_dependencies() {
 # ---------------------------------------------------------------------------
 init_state() {
     install -d -m 0755 "${STATE_DIR}"
+    install -d -m 0700 "${AWG_CLIENTS_DIR}"
     install -d -m 0755 "${XRAY_CONF_DIR}"
     install -d -m 0755 "${XRAY_LOG_DIR}"
     [[ -f "${XRAY_ACCESS_LOG}" ]] || : > "${XRAY_ACCESS_LOG}"
@@ -343,6 +353,7 @@ mode_human() {
         whitelist_bypass) printf 'White-List Bypass' ;;
         fake_tls)         printf 'Fake TLS' ;;
         mega_crypt)       printf 'Mega Crypt' ;;
+        amneziawg)        printf 'AmneziaWG (obfuscated WireGuard)' ;;
         *)                printf '%s' "$1" ;;
     esac
 }
@@ -353,6 +364,7 @@ proto_human() {
         trojan)       printf 'Trojan' ;;
         xray)         printf 'Xray (VLESS+Vision)' ;;
         shadowsocks)  printf 'Shadowsocks' ;;
+        amneziawg)    printf 'AmneziaWG' ;;
         *)            printf '%s' "$1" ;;
     esac
 }
@@ -478,6 +490,11 @@ write_xray_config() {
         port="$(jq -r '.port // ""'    <<<"${entry}")"
         tag="$(jq -r '.tag // ""'      <<<"${entry}")"
 
+        # AmneziaWG живёт вне Xray — пропускаем в Xray-конфиге.
+        if [[ "${proto}" == "amneziawg" ]]; then
+            continue
+        fi
+
         # Битые/устаревшие записи (без протокола, режима, порта или ID) автоматически удаляем.
         if [[ -z "${id}" || -z "${proto}" || -z "${mode}" || -z "${port}" || "${proto}" == "null" || "${mode}" == "null" ]]; then
             log_warn "Реестр: пропущена и удалена битая запись (id='${id}', protocol='${proto}', mode='${mode}')."
@@ -542,6 +559,320 @@ reload_xray() {
 }
 
 # ---------------------------------------------------------------------------
+# AmneziaWG (обфусцированный WireGuard) — установка и управление
+# ---------------------------------------------------------------------------
+# Установщик: PPA Amnezia (Ubuntu) или официальные пакеты Debian.
+ensure_amneziawg() {
+    if command -v awg >/dev/null 2>&1 && command -v awg-quick >/dev/null 2>&1; then
+        modprobe amneziawg 2>/dev/null || true
+        return 0
+    fi
+    log_info "Устанавливаю AmneziaWG (kernel module + tools)..."
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        die "AmneziaWG-установщик в этом скрипте поддерживает только Debian/Ubuntu. Установите awg/awg-quick вручную."
+    fi
+
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        software-properties-common gnupg ca-certificates lsb-release wget linux-headers-"$(uname -r)" || true
+
+    # Добавляем PPA только один раз.
+    if ! grep -RhsE 'amnezia(vpn)?/(ppa|amneziawg)' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | grep -q .; then
+        if command -v add-apt-repository >/dev/null 2>&1; then
+            add-apt-repository -y ppa:amnezia/ppa \
+                || die "Не удалось добавить ppa:amnezia/ppa. Установите AmneziaWG вручную (https://github.com/amnezia-vpn/amneziawg-tools)."
+        else
+            die "Команда add-apt-repository отсутствует — установите software-properties-common."
+        fi
+    fi
+
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq amneziawg amneziawg-tools amneziawg-dkms \
+        || die "apt-get install amneziawg* завершился с ошибкой. См. вывод apt и dkms."
+
+    command -v awg       >/dev/null 2>&1 || die "Бинарь 'awg' не найден после установки."
+    command -v awg-quick >/dev/null 2>&1 || die "Бинарь 'awg-quick' не найден после установки."
+    modprobe amneziawg 2>/dev/null || true
+    log_ok "AmneziaWG установлен."
+}
+
+# Дефолтный исходящий интерфейс (для NAT-правила).
+default_iface() {
+    local iface
+    iface="$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')"
+    if [[ -z "${iface}" ]]; then
+        iface="$(ip -o link show 2>/dev/null | awk -F': ' '$2 != "lo" {print $2; exit}')"
+    fi
+    [[ -n "${iface}" ]] || iface="eth0"
+    printf '%s' "${iface}"
+}
+
+# Случайные параметры обфускации AmneziaWG.
+# Печатает: jc jmin jmax s1 s2 h1 h2 h3 h4
+random_awg_jitter() {
+    local jc jmin jmax s1 s2 h1 h2 h3 h4
+    jc=$(( (RANDOM % 8) + 4 ))                          # 4..11
+    jmin=$(( (RANDOM % 30) + 50 ))                       # 50..79
+    jmax=$(( jmin + (RANDOM % 800) + 200 ))              # jmin + 200..999
+    s1=$(( (RANDOM % 100) + 15 ))                        # 15..114
+    s2=$(( (RANDOM % 100) + 15 ))                        # 15..114
+    while :; do
+        h1=$(( (RANDOM * RANDOM) | 1 ))
+        h2=$(( (RANDOM * RANDOM) | 1 ))
+        h3=$(( (RANDOM * RANDOM) | 1 ))
+        h4=$(( (RANDOM * RANDOM) | 1 ))
+        [[ "${h1}" != "${h2}" && "${h1}" != "${h3}" && "${h1}" != "${h4}" \
+        && "${h2}" != "${h3}" && "${h2}" != "${h4}" && "${h3}" != "${h4}" ]] && break
+    done
+    printf '%d %d %d %d %d %d %d %d %d' \
+        "${jc}" "${jmin}" "${jmax}" "${s1}" "${s2}" "${h1}" "${h2}" "${h3}" "${h4}"
+}
+
+# Одноразовая инициализация AmneziaWG-сервера (ключи, порт, jitter, NAT).
+awg_init_server() {
+    if [[ -f "${AWG_STATE_FILE}" ]]; then
+        return 0
+    fi
+    log_info "Инициализация AmneziaWG-сервера (одноразово)..."
+    install -d -m 0700 "${AWG_CONF_DIR}"
+    install -d -m 0700 "${AWG_CLIENTS_DIR}"
+
+    local server_priv server_pub
+    server_priv="$(awg genkey)"
+    server_pub="$(printf '%s' "${server_priv}" | awg pubkey)"
+
+    local listen_port; listen_port="$(random_port)"
+    local def_if;     def_if="$(default_iface)"
+
+    local jit jc jmin jmax s1 s2 h1 h2 h3 h4
+    jit="$(random_awg_jitter)"
+    read -r jc jmin jmax s1 s2 h1 h2 h3 h4 <<<"${jit}"
+
+    jq -n \
+        --arg iface       "${AWG_IFACE}" \
+        --arg server_priv "${server_priv}" \
+        --arg server_pub  "${server_pub}" \
+        --argjson listen_port "${listen_port}" \
+        --arg server_ip   "${AWG_SERVER_IP}" \
+        --arg subnet      "${AWG_SUBNET_PREFIX}.0/24" \
+        --arg def_iface   "${def_if}" \
+        --argjson jc "${jc}" --argjson jmin "${jmin}" --argjson jmax "${jmax}" \
+        --argjson s1 "${s1}" --argjson s2 "${s2}" \
+        --argjson h1 "${h1}" --argjson h2 "${h2}" \
+        --argjson h3 "${h3}" --argjson h4 "${h4}" \
+        '{iface:$iface, server_priv:$server_priv, server_pub:$server_pub,
+          listen_port:$listen_port, server_ip:$server_ip, subnet:$subnet,
+          def_iface:$def_iface,
+          jc:$jc, jmin:$jmin, jmax:$jmax, s1:$s1, s2:$s2,
+          h1:$h1, h2:$h2, h3:$h3, h4:$h4,
+          next_octet: 2}' > "${AWG_STATE_FILE}"
+    chmod 0600 "${AWG_STATE_FILE}"
+
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    if ! grep -qE '^\s*net\.ipv4\.ip_forward\s*=\s*1' /etc/sysctl.conf 2>/dev/null; then
+        printf 'net.ipv4.ip_forward=1\n' >> /etc/sysctl.conf
+    fi
+    log_ok "AmneziaWG-сервер инициализирован (порт ${listen_port}, iface ${AWG_IFACE})."
+}
+
+# Резервируем следующий клиентский IP (10.66.66.X, X >= 2).
+awg_next_client_ip() {
+    local octet
+    octet="$(jq -r '.next_octet' "${AWG_STATE_FILE}")"
+    local tmp; tmp="$(mktemp)"
+    jq '.next_octet = (.next_octet + 1)' "${AWG_STATE_FILE}" > "${tmp}"
+    mv "${tmp}" "${AWG_STATE_FILE}"
+    chmod 0600 "${AWG_STATE_FILE}"
+    printf '%s.%d' "${AWG_SUBNET_PREFIX}" "${octet}"
+}
+
+# Сборка awg0.conf (server-side) из реестра + awg-server.json.
+write_awg_config() {
+    [[ -f "${AWG_STATE_FILE}" ]] || return 0
+
+    local server_priv listen_port server_ip jc jmin jmax s1 s2 h1 h2 h3 h4 def_if
+    server_priv="$(jq -r '.server_priv' "${AWG_STATE_FILE}")"
+    listen_port="$(jq -r '.listen_port' "${AWG_STATE_FILE}")"
+    server_ip="$(jq -r '.server_ip'     "${AWG_STATE_FILE}")"
+    jc="$(jq -r '.jc'   "${AWG_STATE_FILE}")"
+    jmin="$(jq -r '.jmin' "${AWG_STATE_FILE}")"
+    jmax="$(jq -r '.jmax' "${AWG_STATE_FILE}")"
+    s1="$(jq -r '.s1'   "${AWG_STATE_FILE}")"
+    s2="$(jq -r '.s2'   "${AWG_STATE_FILE}")"
+    h1="$(jq -r '.h1'   "${AWG_STATE_FILE}")"
+    h2="$(jq -r '.h2'   "${AWG_STATE_FILE}")"
+    h3="$(jq -r '.h3'   "${AWG_STATE_FILE}")"
+    h4="$(jq -r '.h4'   "${AWG_STATE_FILE}")"
+    def_if="$(jq -r '.def_iface' "${AWG_STATE_FILE}")"
+
+    install -d -m 0700 "${AWG_CONF_DIR}"
+    {
+        printf '[Interface]\n'
+        printf 'PrivateKey = %s\n' "${server_priv}"
+        printf 'Address = %s/24\n' "${server_ip}"
+        printf 'ListenPort = %s\n' "${listen_port}"
+        printf 'PostUp = iptables -A FORWARD -i %s -j ACCEPT; iptables -A FORWARD -o %s -j ACCEPT; iptables -t nat -A POSTROUTING -o %s -j MASQUERADE\n' \
+            "${AWG_IFACE}" "${AWG_IFACE}" "${def_if}"
+        printf 'PostDown = iptables -D FORWARD -i %s -j ACCEPT; iptables -D FORWARD -o %s -j ACCEPT; iptables -t nat -D POSTROUTING -o %s -j MASQUERADE\n' \
+            "${AWG_IFACE}" "${AWG_IFACE}" "${def_if}"
+        printf 'Jc = %s\nJmin = %s\nJmax = %s\nS1 = %s\nS2 = %s\nH1 = %s\nH2 = %s\nH3 = %s\nH4 = %s\n' \
+            "${jc}" "${jmin}" "${jmax}" "${s1}" "${s2}" "${h1}" "${h2}" "${h3}" "${h4}"
+        printf '\n'
+
+        local entry id cpub psk cip
+        while read -r entry; do
+            [[ -z "${entry}" ]] && continue
+            [[ "$(jq -r '.protocol' <<<"${entry}")" != "amneziawg" ]] && continue
+            id="$(jq -r '.id'              <<<"${entry}")"
+            cpub="$(jq -r '.awg_client_pub' <<<"${entry}")"
+            psk="$(jq -r '.awg_psk'         <<<"${entry}")"
+            cip="$(jq -r '.awg_client_ip'   <<<"${entry}")"
+            printf '# id=%s\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n\n' \
+                "${id}" "${cpub}" "${psk}" "${cip}"
+        done < <(jq -c '.configs[]' "${REGISTRY_FILE}")
+    } > "${AWG_CONF_FILE}"
+    chmod 0600 "${AWG_CONF_FILE}"
+}
+
+# Перезапуск AmneziaWG-сервиса (через systemd или ручной awg-quick).
+reload_awg() {
+    [[ -f "${AWG_CONF_FILE}" ]] || return 0
+    local unit="awg-quick@${AWG_IFACE}"
+    if systemctl list-unit-files "${unit}.service" >/dev/null 2>&1; then
+        systemctl enable "${unit}" >/dev/null 2>&1 || true
+        systemctl restart "${unit}" || \
+            log_warn "Не удалось перезапустить ${unit}; см. journalctl -u ${unit}."
+        sleep 1
+        if systemctl is-active --quiet "${unit}"; then
+            log_ok "AmneziaWG (${AWG_IFACE}) активен."
+        else
+            log_warn "${unit} не активен — проверьте логи."
+        fi
+    else
+        # Fallback без systemd-юнита.
+        if ip link show "${AWG_IFACE}" >/dev/null 2>&1; then
+            awg-quick down "${AWG_IFACE}" >/dev/null 2>&1 || true
+        fi
+        awg-quick up "${AWG_IFACE}" || \
+            log_warn "Не удалось поднять ${AWG_IFACE} (awg-quick up)."
+    fi
+}
+
+# Сборка клиентского .conf-файла из реестра + awg-server.json.
+build_awg_client_conf() {
+    local id="$1"
+    local entry; entry="$(registry_get_by_id "${id}")"
+    [[ -n "${entry}" ]] || die "Не найден AWG-конфиг ${id}."
+    [[ -f "${AWG_STATE_FILE}" ]] || die "AmneziaWG-сервер не инициализирован."
+
+    local server_pub listen_port jc jmin jmax s1 s2 h1 h2 h3 h4
+    server_pub="$(jq -r '.server_pub'  "${AWG_STATE_FILE}")"
+    listen_port="$(jq -r '.listen_port' "${AWG_STATE_FILE}")"
+    jc="$(jq -r '.jc'   "${AWG_STATE_FILE}")"
+    jmin="$(jq -r '.jmin' "${AWG_STATE_FILE}")"
+    jmax="$(jq -r '.jmax' "${AWG_STATE_FILE}")"
+    s1="$(jq -r '.s1'   "${AWG_STATE_FILE}")"
+    s2="$(jq -r '.s2'   "${AWG_STATE_FILE}")"
+    h1="$(jq -r '.h1'   "${AWG_STATE_FILE}")"
+    h2="$(jq -r '.h2'   "${AWG_STATE_FILE}")"
+    h3="$(jq -r '.h3'   "${AWG_STATE_FILE}")"
+    h4="$(jq -r '.h4'   "${AWG_STATE_FILE}")"
+
+    local host cpriv psk cip
+    host="$(jq -r '.host'             <<<"${entry}")"
+    cpriv="$(jq -r '.awg_client_priv' <<<"${entry}")"
+    psk="$(jq -r '.awg_psk'           <<<"${entry}")"
+    cip="$(jq -r '.awg_client_ip'     <<<"${entry}")"
+
+    install -d -m 0700 "${AWG_CLIENTS_DIR}"
+    local out="${AWG_CLIENTS_DIR}/${id}.conf"
+    {
+        printf '[Interface]\n'
+        printf 'PrivateKey = %s\n' "${cpriv}"
+        printf 'Address = %s/32\n' "${cip}"
+        printf 'DNS = 1.1.1.1, 8.8.8.8\n'
+        printf 'Jc = %s\nJmin = %s\nJmax = %s\nS1 = %s\nS2 = %s\nH1 = %s\nH2 = %s\nH3 = %s\nH4 = %s\n' \
+            "${jc}" "${jmin}" "${jmax}" "${s1}" "${s2}" "${h1}" "${h2}" "${h3}" "${h4}"
+        printf '\n[Peer]\n'
+        printf 'PublicKey = %s\n' "${server_pub}"
+        printf 'PresharedKey = %s\n' "${psk}"
+        printf 'Endpoint = %s:%s\n' "${host}" "${listen_port}"
+        printf 'AllowedIPs = 0.0.0.0/0, ::/0\n'
+        printf 'PersistentKeepalive = 25\n'
+    } > "${out}"
+    chmod 0600 "${out}"
+    printf '%s' "${out}"
+}
+
+# Создание AmneziaWG-конфига (отдельный flow, не как Xray).
+cmd_create_awg() {
+    ensure_amneziawg
+    awg_init_server
+
+    local default_server_name default_config_name detected_ip host
+    default_server_name="$(prompt "Название сервера" "$(hostname -s 2>/dev/null || echo 'vps')")"
+    default_config_name="$(prompt "Название конфига" "${default_server_name}-AWG")"
+    detected_ip="$(public_ip)"
+    host="$(prompt "Адрес сервера (IP / домен)" "${detected_ip}")"
+
+    local id; id="$(random_id)"
+    local listen_port; listen_port="$(jq -r '.listen_port' "${AWG_STATE_FILE}")"
+    local client_ip;   client_ip="$(awg_next_client_ip)"
+
+    local cpriv cpub psk
+    cpriv="$(awg genkey)"
+    cpub="$(printf '%s' "${cpriv}" | awg pubkey)"
+    psk="$(awg genpsk)"
+
+    local entry
+    entry="$(jq -n \
+        --arg id        "${id}" \
+        --arg name      "${default_config_name}" \
+        --arg server    "${default_server_name}" \
+        --arg host      "${host}" \
+        --argjson port  "${listen_port}" \
+        --arg tag       "amneziawg-${id}" \
+        --arg protocol  "amneziawg" \
+        --arg mode      "amneziawg" \
+        --arg delivery  "solo" \
+        --arg created   "$(date -u +%FT%TZ)" \
+        --arg cpriv     "${cpriv}" \
+        --arg cpub      "${cpub}" \
+        --arg psk       "${psk}" \
+        --arg cip       "${client_ip}" \
+        '{id:$id, name:$name, server:$server, host:$host, port:$port, tag:$tag,
+          protocol:$protocol, mode:$mode, delivery:$delivery, created:$created,
+          security:"none",
+          awg_client_priv:$cpriv, awg_client_pub:$cpub, awg_psk:$psk, awg_client_ip:$cip}')"
+
+    registry_add "${entry}"
+    write_awg_config
+    reload_awg
+
+    local conf_path; conf_path="$(build_awg_client_conf "${id}")"
+
+    printf '\n%b%s%b\n' "${C_BOLD}" "AmneziaWG конфиг создан" "${C_RESET}"
+    printf '  ID         : %s\n' "${id}"
+    printf '  Сервер     : %s (%s:%s/udp)\n' "${default_server_name}" "${host}" "${listen_port}"
+    printf '  Имя        : %s\n' "${default_config_name}"
+    printf '  Клиент IP  : %s\n' "${client_ip}"
+    printf '  Файл       : %s\n' "${conf_path}"
+
+    printf '\n%b%s%b\n' "${C_GREEN}" "Содержимое для импорта в AmneziaVPN:" "${C_RESET}"
+    cat "${conf_path}"
+
+    if command -v qrencode >/dev/null 2>&1; then
+        printf '\nQR-код (отсканируйте в AmneziaVPN на телефоне):\n'
+        qrencode -t ansiutf8 < "${conf_path}" || true
+    fi
+
+    printf '\n%bПримечание:%b Happ AmneziaWG не поддерживает (другой стек).\n' "${C_DIM}" "${C_RESET}"
+    printf 'Установите клиент AmneziaVPN: https://amnezia.org/ — импортируйте файл .conf или QR-код.\n'
+    printf 'Откройте на сервере UDP-порт %s в фаерволе/security-group.\n' "${listen_port}"
+}
+
+# ---------------------------------------------------------------------------
 # Генерация share-ссылок (vless/trojan/ss)
 # ---------------------------------------------------------------------------
 build_share_link() {
@@ -598,6 +929,12 @@ build_share_link() {
             b64="$(printf '%s' "${userinfo}" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
             printf 'ss://%s@%s:%s#%s\n' "${b64}" "${host}" "${port}" "${enc_name}"
             ;;
+        amneziawg)
+            # AmneziaWG не имеет share-URL: выводим путь к .conf-файлу.
+            local conf_path="${AWG_CLIENTS_DIR}/${id}.conf"
+            [[ -f "${conf_path}" ]] || conf_path="$(build_awg_client_conf "${id}" 2>/dev/null || printf '%s' "${conf_path}")"
+            printf 'awg-conf://%s\n' "${conf_path}"
+            ;;
         *)
             die "Неизвестный протокол ${proto}."
             ;;
@@ -630,12 +967,14 @@ choose_protocol() {
         "VLESS" \
         "Trojan" \
         "Xray (VLESS + xtls-rprx-vision)" \
-        "Shadowsocks")"
+        "Shadowsocks" \
+        "AmneziaWG (WireGuard + обфускация — обход белых списков)")"
     case "${idx}" in
         0) printf 'vless' ;;
         1) printf 'trojan' ;;
         2) printf 'xray' ;;
         3) printf 'shadowsocks' ;;
+        4) printf 'amneziawg' ;;
     esac
 }
 
@@ -652,13 +991,20 @@ choose_solo_or_merge() {
 
 cmd_create() {
     local mode protocol delivery
-    mode="$(choose_mode)"
     protocol="$(choose_protocol)"
+    [[ -n "${protocol}" ]] || die "Пустое значение protocol (выбор протокола не сработал)."
+
+    # AmneziaWG — отдельный стек, без выбора mode/Solo-Merge.
+    if [[ "${protocol}" == "amneziawg" ]]; then
+        cmd_create_awg
+        return
+    fi
+
+    mode="$(choose_mode)"
     delivery="$(choose_solo_or_merge)"
 
     # Защита от пустых значений (например, если choose-функция была сломана).
     [[ -n "${mode}"     ]] || die "Пустое значение mode (выбор маскировки не сработал)."
-    [[ -n "${protocol}" ]] || die "Пустое значение protocol (выбор протокола не сработал)."
     [[ -n "${delivery}" ]] || die "Пустое значение delivery (выбор Solo/Merge не сработал)."
 
     local default_server_name default_config_name detected_ip host port
@@ -800,16 +1146,26 @@ cmd_delete() {
         fi
     fi
 
-    local id link
+    local id link proto had_awg=0
     for id in "${ids_to_delete[@]}"; do
-        link="$(build_share_link "${id}" 2>/dev/null || true)"
+        proto="$(jq -r --arg id "${id}" '.configs[] | select(.id==$id) | .protocol // ""' "${REGISTRY_FILE}")"
+        if [[ "${proto}" == "amneziawg" ]]; then
+            had_awg=1
+            rm -f "${AWG_CLIENTS_DIR}/${id}.conf"
+        else
+            link="$(build_share_link "${id}" 2>/dev/null || true)"
+            [[ -n "${link}" ]] && happ_remove_link "${link}"
+        fi
         registry_remove "${id}"
-        [[ -n "${link}" ]] && happ_remove_link "${link}"
         log_ok "Удалён конфиг ${id}."
     done
 
     write_xray_config
     reload_xray
+    if (( had_awg )); then
+        write_awg_config
+        reload_awg
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -831,11 +1187,16 @@ cmd_list() {
                 "${id}" "${name:0:26}" "${proto}" "${mode}" "${port}" "${host}"
         done
 
-    printf '\n%bShare-ссылки:%b\n' "${C_DIM}" "${C_RESET}"
-    while read -r id; do
-        [[ -z "${id}" ]] && continue
-        printf '  [%s] %s\n' "${id}" "$(build_share_link "${id}")"
-    done < <(jq -r '.configs[].id' "${REGISTRY_FILE}")
+    printf '\n%bShare-ссылки / .conf-файлы:%b\n' "${C_DIM}" "${C_RESET}"
+    local _id _proto
+    while IFS=$'\t' read -r _id _proto; do
+        [[ -z "${_id}" ]] && continue
+        if [[ "${_proto}" == "amneziawg" ]]; then
+            printf '  [%s] AmneziaWG → %s\n' "${_id}" "${AWG_CLIENTS_DIR}/${_id}.conf"
+        else
+            printf '  [%s] %s\n' "${_id}" "$(build_share_link "${_id}")"
+        fi
+    done < <(jq -r '.configs[] | [.id, .protocol] | @tsv' "${REGISTRY_FILE}")
 }
 
 # ---------------------------------------------------------------------------
@@ -855,9 +1216,12 @@ cmd_connections() {
     printf '\n%bConnected devices:%b\n' "${C_BOLD}" "${C_RESET}"
     local printed=0
 
+    # ---- Xray-инбаунды ----
     while read -r entry; do
         [[ -z "${entry}" ]] && continue
-        local id tag link cnt
+        local id proto tag link cnt
+        proto="$(jq -r '.protocol' <<<"${entry}")"
+        [[ "${proto}" == "amneziawg" ]] && continue
         id="$(jq -r '.id'  <<<"${entry}")"
         tag="$(jq -r '.tag' <<<"${entry}")"
         link="$(build_share_link "${id}")"
@@ -889,6 +1253,28 @@ cmd_connections() {
             printed=$((printed+1))
         fi
     done < <(jq -c '.configs[]' "${REGISTRY_FILE}")
+
+    # ---- AmneziaWG-пиры ----
+    if command -v awg >/dev/null 2>&1 && ip link show "${AWG_IFACE}" >/dev/null 2>&1; then
+        local awg_handshakes awg_now
+        awg_now="$(date +%s)"
+        awg_handshakes="$(awg show "${AWG_IFACE}" latest-handshakes 2>/dev/null || true)"
+        while read -r entry; do
+            [[ -z "${entry}" ]] && continue
+            local proto id pub last diff
+            proto="$(jq -r '.protocol' <<<"${entry}")"
+            [[ "${proto}" != "amneziawg" ]] && continue
+            id="$(jq -r '.id'              <<<"${entry}")"
+            pub="$(jq -r '.awg_client_pub' <<<"${entry}")"
+            last="$(awk -v p="${pub}" '$1==p {print $2}' <<<"${awg_handshakes}")"
+            last="${last:-0}"
+            diff=$(( awg_now - last ))
+            if (( last > 0 && diff <= 180 )); then
+                printf 'awg-conf://%s.conf | 1 Device (handshake %ds ago)\n' "${id}" "${diff}"
+                printed=$((printed+1))
+            fi
+        done < <(jq -c '.configs[]' "${REGISTRY_FILE}")
+    fi
 
     if [[ "${printed}" -eq 0 ]]; then
         printf '%bАктивных подключений не обнаружено за последние 5 минут.%b\n' "${C_DIM}" "${C_RESET}"
@@ -943,12 +1329,14 @@ cmd_traffic() {
     printf '%s\n' "------------------------------------------------------------------------------------"
 
     local sum_in=0 sum_out=0
+    # ---- Xray-инбаунды ----
     while read -r entry; do
         [[ -z "${entry}" ]] && continue
         local id name proto tag in_b out_b
+        proto="$(jq -r '.protocol' <<<"${entry}")"
+        [[ "${proto}" == "amneziawg" ]] && continue
         id="$(jq -r '.id'       <<<"${entry}")"
         name="$(jq -r '.name'   <<<"${entry}")"
-        proto="$(jq -r '.protocol' <<<"${entry}")"
         tag="$(jq -r '.tag'     <<<"${entry}")"
         in_b="$(xray_stat  "inbound>>>${tag}>>>traffic>>>uplink"   false)"
         out_b="$(xray_stat "inbound>>>${tag}>>>traffic>>>downlink" false)"
@@ -959,6 +1347,30 @@ cmd_traffic() {
             "${id}" "${name:0:26}" "${proto}" \
             "$(human_bytes "${in_b}")" "$(human_bytes "${out_b}")"
     done < <(jq -c '.configs[]' "${REGISTRY_FILE}")
+
+    # ---- AmneziaWG-пиры ----
+    if command -v awg >/dev/null 2>&1 && ip link show "${AWG_IFACE}" >/dev/null 2>&1; then
+        local awg_transfer
+        awg_transfer="$(awg show "${AWG_IFACE}" transfer 2>/dev/null || true)"
+        while read -r entry; do
+            [[ -z "${entry}" ]] && continue
+            local proto id name pub stats rx tx
+            proto="$(jq -r '.protocol' <<<"${entry}")"
+            [[ "${proto}" != "amneziawg" ]] && continue
+            id="$(jq -r '.id'              <<<"${entry}")"
+            name="$(jq -r '.name'          <<<"${entry}")"
+            pub="$(jq -r '.awg_client_pub' <<<"${entry}")"
+            # Формат: <pubkey>\t<rx>\t<tx>
+            stats="$(awk -v p="${pub}" '$1==p {print $2 " " $3}' <<<"${awg_transfer}")"
+            read -r rx tx <<<"${stats:-0 0}"
+            rx="${rx:-0}"; tx="${tx:-0}"
+            sum_in=$(( sum_in + rx ))
+            sum_out=$(( sum_out + tx ))
+            printf '%-10s %-26s %-12s %-14s %-14s\n' \
+                "${id}" "${name:0:26}" "amneziawg" \
+                "$(human_bytes "${rx}")" "$(human_bytes "${tx}")"
+        done < <(jq -c '.configs[]' "${REGISTRY_FILE}")
+    fi
 
     printf '%s\n' "------------------------------------------------------------------------------------"
     printf '%-50s %-14s %-14s\n' "ИТОГО:" \
