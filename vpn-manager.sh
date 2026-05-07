@@ -468,17 +468,31 @@ build_inbound_json() {
 write_xray_config() {
     local inbounds="[]"
     local id proto mode port tag entry inb
+    local purged=0
 
     while read -r entry; do
         [[ -z "${entry}" ]] && continue
-        id="$(jq -r '.id'        <<<"${entry}")"
-        proto="$(jq -r '.protocol' <<<"${entry}")"
-        mode="$(jq -r '.mode'    <<<"${entry}")"
-        port="$(jq -r '.port'    <<<"${entry}")"
-        tag="$(jq -r '.tag'      <<<"${entry}")"
+        id="$(jq -r '.id // ""'        <<<"${entry}")"
+        proto="$(jq -r '.protocol // ""' <<<"${entry}")"
+        mode="$(jq -r '.mode // ""'    <<<"${entry}")"
+        port="$(jq -r '.port // ""'    <<<"${entry}")"
+        tag="$(jq -r '.tag // ""'      <<<"${entry}")"
+
+        # Битые/устаревшие записи (без протокола, режима, порта или ID) автоматически удаляем.
+        if [[ -z "${id}" || -z "${proto}" || -z "${mode}" || -z "${port}" || "${proto}" == "null" || "${mode}" == "null" ]]; then
+            log_warn "Реестр: пропущена и удалена битая запись (id='${id}', protocol='${proto}', mode='${mode}')."
+            [[ -n "${id}" ]] && registry_remove "${id}"
+            purged=$((purged+1))
+            continue
+        fi
+
         inb="$(build_inbound_json "${id}" "${proto}" "${mode}" "${port}" "${tag}")"
         inbounds="$(jq --argjson new "${inb}" '. + [$new]' <<<"${inbounds}")"
     done < <(jq -c '.configs[]' "${REGISTRY_FILE}")
+
+    if (( purged > 0 )); then
+        log_warn "Удалено битых записей из реестра: ${purged}."
+    fi
 
     # API-инбаунд для статистики
     local api_inbound
@@ -641,6 +655,11 @@ cmd_create() {
     mode="$(choose_mode)"
     protocol="$(choose_protocol)"
     delivery="$(choose_solo_or_merge)"
+
+    # Защита от пустых значений (например, если choose-функция была сломана).
+    [[ -n "${mode}"     ]] || die "Пустое значение mode (выбор маскировки не сработал)."
+    [[ -n "${protocol}" ]] || die "Пустое значение protocol (выбор протокола не сработал)."
+    [[ -n "${delivery}" ]] || die "Пустое значение delivery (выбор Solo/Merge не сработал)."
 
     local default_server_name default_config_name detected_ip host port
     default_server_name="$(prompt "Название сервера" "$(hostname -s 2>/dev/null || echo 'vps')")"
