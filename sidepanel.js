@@ -1,6 +1,8 @@
-// sidepanel.js — UI controller. Talks to content scripts in every frame of the
-// active tab via chrome.tabs.sendMessage(..., {frameId}). Each frame has its
-// own injected.js MAIN-world state (scans + frozen entries).
+// sidepanel.js — UI controller. Talks to a content-script bridge that runs in
+// every frame of the active tab. Frame discovery and script injection use
+// chrome.scripting.executeScript({allFrames:true}) which works for every frame
+// the extension is allowed into (incl. cross-origin iframes the host page
+// embeds, like a Unity/WebGL player iframe inside www.kogama.com).
 
 const $ = (id) => document.getElementById(id);
 
@@ -24,56 +26,128 @@ const els = {
   btnFramesRefresh: $("btn-frames-refresh"),
 };
 
+const ALL = "all";
+
 let activeTabId = null;
 let frameList = []; // [{ frameId, url, label }]
-let activeFrame = "all"; // "all" | numeric frameId
+let activeFrame = ALL;
 let lastResults = [];
 let frozenList = [];
 let refreshTimer = null;
 let framesRefreshTimer = null;
 
-const ALL = "all";
-
 // ---- Tab / frame management ------------------------------------------------
 
 async function getActiveTab() {
-  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  let tab;
+  try {
+    [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  } catch (e) {}
+  if (!tab) {
+    try {
+      [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    } catch (e) {}
+  }
   return tab || null;
 }
 
-function frameLabel(frame) {
-  if (frame.frameId === 0) return "main";
-  let url = frame.url || "";
-  if (!url || url === "about:blank") return "iframe #" + frame.frameId + " (blank)";
+function frameLabel(info) {
+  const fid = info.frameId;
+  const url = info.url || "";
+  if (fid === 0) return "main" + (url ? " (" + shortHost(url) + ")" : "");
+  if (!url || url === "about:blank") return "iframe #" + fid + " (blank)";
   try {
     const u = new URL(url);
     let path = u.pathname;
-    if (path.length > 28) path = "…" + path.slice(-27);
+    if (path.length > 24) path = "…" + path.slice(-23);
     return "iframe " + u.host + path;
   } catch (e) {
-    return "iframe #" + frame.frameId;
+    return "iframe #" + fid;
   }
 }
 
-async function refreshFrames() {
-  if (activeTabId == null) {
-    frameList = [];
-    renderFrameSelect();
-    return;
-  }
-  let frames;
+function shortHost(url) {
   try {
-    frames = await chrome.webNavigation.getAllFrames({ tabId: activeTabId });
+    return new URL(url).host;
   } catch (e) {
-    frames = [{ frameId: 0, url: "" }];
+    return "";
   }
-  if (!frames) frames = [];
-  frames.sort((a, b) => a.frameId - b.frameId);
-  frameList = frames.map((f) => ({
-    frameId: f.frameId,
-    url: f.url || "",
-    label: frameLabel(f),
-  }));
+}
+
+// Discover all frames AND ensure both bridge (ISOLATED) and scanner (MAIN) are
+// loaded in every frame. Idempotent — safe to call repeatedly.
+async function discoverAndAttachAllFrames() {
+  if (activeTabId == null) return [];
+
+  // 1. Inject bridge content.js into every frame. Idempotent thanks to the
+  // __WCE_BRIDGE_INSTALLED__ guard inside content.js.
+  let bridgeRes = [];
+  try {
+    bridgeRes = await chrome.scripting.executeScript({
+      target: { tabId: activeTabId, allFrames: true },
+      files: ["content.js"],
+    });
+  } catch (e) {
+    // Tab may have just navigated; surface a softer status to the UI.
+    console.warn("[WCE] content.js inject failed:", e);
+  }
+
+  // 2. Inject the MAIN-world scanner. Idempotent thanks to
+  // __WEB_CHEAT_ENGINE_INSTALLED__.
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: activeTabId, allFrames: true },
+      files: ["injected.js"],
+      world: "MAIN",
+    });
+  } catch (e) {
+    console.warn("[WCE] injected.js inject failed:", e);
+  }
+
+  // 3. Collect frame URLs and ids using a tiny inline function. This is the
+  // most reliable way to enumerate frames the extension can reach.
+  let infos = [];
+  try {
+    infos = await chrome.scripting.executeScript({
+      target: { tabId: activeTabId, allFrames: true },
+      func: () => {
+        let href = "";
+        try { href = location.href; } catch (e) {}
+        let title = "";
+        try { title = document.title || ""; } catch (e) {}
+        return { href: href, title: title, isTop: window.top === window };
+      },
+    });
+  } catch (e) {
+    console.warn("[WCE] frame enumeration failed:", e);
+  }
+
+  // Combine: take the union of frame ids reported by either inject or query.
+  const known = new Map();
+  for (const r of bridgeRes || []) {
+    if (r && typeof r.frameId === "number") {
+      known.set(r.frameId, { frameId: r.frameId, url: "" });
+    }
+  }
+  for (const r of infos || []) {
+    if (r && typeof r.frameId === "number") {
+      const cur = known.get(r.frameId) || { frameId: r.frameId, url: "" };
+      if (r.result) {
+        cur.url = r.result.href || "";
+        cur.title = r.result.title || "";
+        cur.isTop = !!r.result.isTop;
+      }
+      known.set(r.frameId, cur);
+    }
+  }
+
+  const list = Array.from(known.values()).sort((a, b) => a.frameId - b.frameId);
+  frameList = list.map((f) => ({ ...f, label: frameLabel(f) }));
+  return frameList;
+}
+
+async function refreshFrames() {
+  await discoverAndAttachAllFrames();
   renderFrameSelect();
 }
 
@@ -142,60 +216,61 @@ function sendToFrame(tabId, frameId, payload, timeoutMs = 4000) {
   });
 }
 
-async function ensureFrameAttached(tabId, frameId) {
-  try {
-    const r = await sendToFrame(tabId, frameId, { cmd: "ping" }, 600);
-    if (r && r.pong) return true;
-  } catch (e) {
-    // not attached yet
-  }
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId, frameIds: [frameId] },
-      files: ["content.js"],
-    });
-    await new Promise((r) => setTimeout(r, 100));
-    const r = await sendToFrame(tabId, frameId, { cmd: "ping" }, 800);
-    return !!(r && r.pong);
-  } catch (err) {
-    return false;
-  }
-}
-
 async function callFrame(frameId, payload) {
   if (activeTabId == null) {
     const tab = await getActiveTab();
     if (!tab) throw new Error("No active tab");
     activeTabId = tab.id;
   }
-  const ok = await ensureFrameAttached(activeTabId, frameId);
-  if (!ok) throw new Error("Cannot attach to frame " + frameId + " (restricted URL?)");
-  return sendToFrame(activeTabId, frameId, payload);
+  // Ensure attached.
+  try {
+    return await sendToFrame(activeTabId, frameId, payload);
+  } catch (e) {
+    // Re-attach and retry once.
+    await discoverAndAttachAllFrames();
+    return await sendToFrame(activeTabId, frameId, payload);
+  }
 }
 
-// Send to selected frame, or fan out to ALL frames if "all" or fanout=true.
-async function callActive(payload, { fanout = false, perFrameTimeout = 4000 } = {}) {
+// Send to selected frame, or fan out to all frames when "All frames" is
+// selected (or fanout=true is forced).
+async function callActive(payload, { fanout = false, perFrameTimeout = 6000 } = {}) {
   if (activeTabId == null) {
     const tab = await getActiveTab();
     if (!tab) throw new Error("No active tab");
     activeTabId = tab.id;
   }
-  if (!fanout && activeFrame !== ALL) {
-    return [
-      { frameId: Number(activeFrame), payload: await callFrame(Number(activeFrame), payload) },
-    ];
-  }
+  // Always re-discover so dynamically inserted iframes are picked up before
+  // the user-issued action runs.
+  await discoverAndAttachAllFrames();
+  renderFrameSelect();
+
+  const wantAll = fanout || activeFrame === ALL;
+  const targets = wantAll
+    ? frameList.map((f) => f.frameId)
+    : [Number(activeFrame)];
+
   const results = [];
-  for (const f of frameList) {
-    try {
-      const ok = await ensureFrameAttached(activeTabId, f.frameId);
-      if (!ok) continue;
-      const r = await sendToFrame(activeTabId, f.frameId, payload, perFrameTimeout);
-      results.push({ frameId: f.frameId, payload: r });
-    } catch (e) {
-      // skip frame
-    }
-  }
+  // Fan-out in parallel for speed.
+  await Promise.all(
+    targets.map(async (fid) => {
+      try {
+        const r = await sendToFrame(activeTabId, fid, payload, perFrameTimeout);
+        results.push({ frameId: fid, payload: r });
+      } catch (e) {
+        // If single-frame target failed, try one more time after re-injection.
+        if (!wantAll) {
+          try {
+            await discoverAndAttachAllFrames();
+            const r = await sendToFrame(activeTabId, fid, payload, perFrameTimeout);
+            results.push({ frameId: fid, payload: r });
+            return;
+          } catch (e2) {}
+        }
+        // Otherwise just skip this frame (sandboxed / chrome:// / closed).
+      }
+    })
+  );
   return results;
 }
 
@@ -342,7 +417,8 @@ function renderFrozen(list) {
     const nameInput = document.createElement("input");
     nameInput.className = "name-input";
     nameInput.value = e.name;
-    nameInput.title = (fid !== 0 ? "[" + findFrameLabel(fid) + "] " : "") + (e.path || []).join(" > ");
+    nameInput.title =
+      (fid !== 0 ? "[" + findFrameLabel(fid) + "] " : "") + (e.path || []).join(" > ");
     nameInput.addEventListener("change", async () => {
       try {
         const r = await callFrame(fid, {
@@ -439,7 +515,6 @@ function renderFrozen(list) {
 }
 
 async function refreshFrozen() {
-  // Always aggregate frozen list across all frames so user sees everything.
   try {
     const arr = await callActive({ cmd: "freezeList" }, { fanout: true });
     const merged = [];
@@ -514,6 +589,10 @@ async function onRefresh() {
     const arr = await callActive({ cmd: "refresh" });
     renderResults(mergeResultPayloads(arr));
     await refreshFrozen();
+    setStatus(
+      "Refreshed (" + frameList.length + " frame(s) attached)",
+      "ok"
+    );
   } catch (err) {
     setStatus("Error: " + err.message, "err");
   }
@@ -578,8 +657,12 @@ async function init() {
   els.btnNew.addEventListener("click", onNewScan);
   els.btnRefresh.addEventListener("click", onRefresh);
   els.btnFramesRefresh.addEventListener("click", async () => {
+    setStatus("Discovering frames…");
     await refreshFrames();
-    setStatus("Frames refreshed (" + frameList.length + ")", "ok");
+    setStatus(
+      "Found " + frameList.length + " frame(s)",
+      frameList.length > 0 ? "ok" : "err"
+    );
   });
 
   els.frame.addEventListener("change", () => {
@@ -600,11 +683,12 @@ async function init() {
     if (tabId === activeTabId && info.status === "complete") attach();
   });
 
-  // React to new frames being created in our tab so dynamically inserted
-  // iframes (e.g. WebGL game frame added 3 minutes after page load) show up.
+  // React to new frames being created in our tab.
   if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
     chrome.webNavigation.onCommitted.addListener((details) => {
       if (details.tabId !== activeTabId) return;
+      // Re-discover ~250 ms after navigation so a freshly-attached iframe
+      // (e.g. WebGL game frame inserted minutes after page load) shows up.
       setTimeout(refreshFrames, 250);
     });
   }
@@ -627,26 +711,31 @@ async function init() {
     }
   }, 800);
 
-  // Safety net — re-fetch frame list every few seconds.
+  // Safety net — re-discover frames every few seconds in case an iframe
+  // appeared without firing webNavigation events (rare but possible for
+  // synthetic frames or aggressive about:srcdoc swaps).
   framesRefreshTimer = setInterval(() => {
     if (document.hidden) return;
     refreshFrames();
-  }, 3000);
+  }, 2500);
 }
 
 async function attach() {
+  if (activeTabId == null) {
+    const tab = await getActiveTab();
+    if (tab) activeTabId = tab.id;
+  }
   if (activeTabId == null) {
     setStatus("No active tab", "err");
     return;
   }
   try {
     await refreshFrames();
-    const ok = await ensureFrameAttached(activeTabId, 0);
-    setStatus(
-      ok ? "Attached (" + frameList.length + " frame(s))" : "Cannot attach to this page",
-      ok ? "ok" : "err"
-    );
-    if (!ok) return;
+    if (frameList.length === 0) {
+      setStatus("Cannot attach to this page", "err");
+      return;
+    }
+    setStatus("Attached (" + frameList.length + " frame(s))", "ok");
     await refreshFrozen();
     const arr = await callActive({ cmd: "refresh" });
     renderResults(mergeResultPayloads(arr));

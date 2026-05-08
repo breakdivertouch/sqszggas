@@ -545,6 +545,17 @@
       switch (cmd) {
         case "ping":
           return { ok: true, pong: true };
+        case "getInfo":
+          return {
+            ok: true,
+            url: (function () {
+              try { return location.href; } catch (e) { return ""; }
+            })(),
+            title: (function () {
+              try { return document.title || ""; } catch (e) { return ""; }
+            })(),
+            isTop: window.top === window,
+          };
         case "firstScan":
           return { ok: true, ...firstScan(payload) };
         case "nextScan":

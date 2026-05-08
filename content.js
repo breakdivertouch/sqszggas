@@ -1,31 +1,23 @@
-// content.js — bridge between the extension (sidepanel/background) and the page's MAIN world.
-// Runs in the ISOLATED world of the page so it has access to chrome.* APIs.
+// content.js — bridge between the extension (sidepanel/background) and the
+// page's MAIN world. Runs in the ISOLATED world of the page so it has access
+// to chrome.* APIs. The MAIN-world script (injected.js) is loaded directly via
+// the manifest's content_scripts entry with world:"MAIN" (and via
+// chrome.scripting.executeScript on demand by the side panel) — this file no
+// longer touches the DOM, which makes it work on CSP-strict pages too.
 
 (function () {
+  if (window.__WCE_BRIDGE_INSTALLED__) return;
+  window.__WCE_BRIDGE_INSTALLED__ = true;
+
   const SOURCE_PAGE = "WCE_PAGE";
   const SOURCE_EXT = "WCE_EXT";
 
-  // Inject the MAIN-world script that does the actual scanning/freezing.
-  function inject() {
-    try {
-      const url = chrome.runtime.getURL("injected.js");
-      const script = document.createElement("script");
-      script.src = url;
-      script.async = false;
-      script.dataset.wce = "1";
-      (document.head || document.documentElement).appendChild(script);
-      script.addEventListener("load", () => script.remove());
-    } catch (err) {
-      console.warn("[WebCheatEngine] inject failed:", err);
-    }
-  }
-  inject();
-
-  // Forward messages from the page's MAIN world to the extension.
+  // Forward unsolicited events from the page's MAIN world to the extension.
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
     const data = event.data;
     if (!data || data.source !== SOURCE_PAGE) return;
+    if (data.unsolicited !== true) return;
     try {
       chrome.runtime.sendMessage({
         type: "WCE_FROM_PAGE",
