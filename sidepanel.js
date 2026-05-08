@@ -1,5 +1,6 @@
-// sidepanel.js — UI controller. Talks to the content script (and through it the
-// page's MAIN world) via chrome.tabs.sendMessage / chrome.runtime.
+// sidepanel.js — UI controller. Talks to content scripts in every frame of the
+// active tab via chrome.tabs.sendMessage(..., {frameId}). Each frame has its
+// own injected.js MAIN-world state (scans + frozen entries).
 
 const $ = (id) => document.getElementById(id);
 
@@ -19,57 +20,104 @@ const els = {
   resultsTruncated: $("results-truncated"),
   frozen: $("frozen"),
   frozenCount: $("frozen-count"),
+  frame: $("frame"),
+  btnFramesRefresh: $("btn-frames-refresh"),
 };
 
 let activeTabId = null;
-let lastResults = []; // local cache from page
+let frameList = []; // [{ frameId, url, label }]
+let activeFrame = "all"; // "all" | numeric frameId
+let lastResults = [];
 let frozenList = [];
 let refreshTimer = null;
+let framesRefreshTimer = null;
 
-// ---- Tab management --------------------------------------------------------
+const ALL = "all";
+
+// ---- Tab / frame management ------------------------------------------------
 
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   return tab || null;
 }
 
-async function ensureContentScript(tabId) {
-  // Try to ping; if no response, attempt to inject the content script.
+function frameLabel(frame) {
+  if (frame.frameId === 0) return "main";
+  let url = frame.url || "";
+  if (!url || url === "about:blank") return "iframe #" + frame.frameId + " (blank)";
   try {
-    const r = await sendToTab(tabId, { cmd: "ping" }, 500);
-    if (r && r.pong) return true;
+    const u = new URL(url);
+    let path = u.pathname;
+    if (path.length > 28) path = "…" + path.slice(-27);
+    return "iframe " + u.host + path;
   } catch (e) {
-    // ignore
-  }
-
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content.js"],
-    });
-    // Give the injected script a tick to install.
-    await new Promise((r) => setTimeout(r, 150));
-    const r = await sendToTab(tabId, { cmd: "ping" }, 800);
-    return !!(r && r.pong);
-  } catch (err) {
-    console.warn("[WCE] could not inject content script:", err);
-    return false;
+    return "iframe #" + frame.frameId;
   }
 }
 
-function sendToTab(tabId, payload, timeoutMs = 4000) {
+async function refreshFrames() {
+  if (activeTabId == null) {
+    frameList = [];
+    renderFrameSelect();
+    return;
+  }
+  let frames;
+  try {
+    frames = await chrome.webNavigation.getAllFrames({ tabId: activeTabId });
+  } catch (e) {
+    frames = [{ frameId: 0, url: "" }];
+  }
+  if (!frames) frames = [];
+  frames.sort((a, b) => a.frameId - b.frameId);
+  frameList = frames.map((f) => ({
+    frameId: f.frameId,
+    url: f.url || "",
+    label: frameLabel(f),
+  }));
+  renderFrameSelect();
+}
+
+function renderFrameSelect() {
+  const prev = els.frame.value;
+  while (els.frame.firstChild) els.frame.removeChild(els.frame.firstChild);
+  const all = document.createElement("option");
+  all.value = ALL;
+  all.textContent = "All frames (" + frameList.length + ")";
+  els.frame.appendChild(all);
+  for (const f of frameList) {
+    const opt = document.createElement("option");
+    opt.value = String(f.frameId);
+    opt.textContent = f.label;
+    els.frame.appendChild(opt);
+  }
+  const wanted = prev || activeFrame;
+  if (wanted === ALL || wanted == null) {
+    els.frame.value = ALL;
+    activeFrame = ALL;
+  } else {
+    const exists = frameList.some((f) => String(f.frameId) === String(wanted));
+    els.frame.value = exists ? String(wanted) : ALL;
+    activeFrame = exists ? Number(wanted) : ALL;
+  }
+}
+
+// ---- Messaging -------------------------------------------------------------
+
+function sendToFrame(tabId, frameId, payload, timeoutMs = 4000) {
   return new Promise((resolve, reject) => {
     let done = false;
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
-      reject(new Error("Timed out waiting for page response"));
+      reject(new Error("Timed out"));
     }, timeoutMs);
 
+    const opts = frameId == null ? undefined : { frameId };
     try {
       chrome.tabs.sendMessage(
         tabId,
         { type: "WCE_TO_PAGE", requestId: String(Math.random()), payload },
+        opts,
         (resp) => {
           if (done) return;
           done = true;
@@ -94,15 +142,61 @@ function sendToTab(tabId, payload, timeoutMs = 4000) {
   });
 }
 
-async function call(payload) {
+async function ensureFrameAttached(tabId, frameId) {
+  try {
+    const r = await sendToFrame(tabId, frameId, { cmd: "ping" }, 600);
+    if (r && r.pong) return true;
+  } catch (e) {
+    // not attached yet
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      files: ["content.js"],
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    const r = await sendToFrame(tabId, frameId, { cmd: "ping" }, 800);
+    return !!(r && r.pong);
+  } catch (err) {
+    return false;
+  }
+}
+
+async function callFrame(frameId, payload) {
   if (activeTabId == null) {
     const tab = await getActiveTab();
     if (!tab) throw new Error("No active tab");
     activeTabId = tab.id;
   }
-  const ok = await ensureContentScript(activeTabId);
-  if (!ok) throw new Error("Cannot attach to this page (chrome:// or restricted URL?)");
-  return sendToTab(activeTabId, payload);
+  const ok = await ensureFrameAttached(activeTabId, frameId);
+  if (!ok) throw new Error("Cannot attach to frame " + frameId + " (restricted URL?)");
+  return sendToFrame(activeTabId, frameId, payload);
+}
+
+// Send to selected frame, or fan out to ALL frames if "all" or fanout=true.
+async function callActive(payload, { fanout = false, perFrameTimeout = 4000 } = {}) {
+  if (activeTabId == null) {
+    const tab = await getActiveTab();
+    if (!tab) throw new Error("No active tab");
+    activeTabId = tab.id;
+  }
+  if (!fanout && activeFrame !== ALL) {
+    return [
+      { frameId: Number(activeFrame), payload: await callFrame(Number(activeFrame), payload) },
+    ];
+  }
+  const results = [];
+  for (const f of frameList) {
+    try {
+      const ok = await ensureFrameAttached(activeTabId, f.frameId);
+      if (!ok) continue;
+      const r = await sendToFrame(activeTabId, f.frameId, payload, perFrameTimeout);
+      results.push({ frameId: f.frameId, payload: r });
+    } catch (e) {
+      // skip frame
+    }
+  }
+  return results;
 }
 
 // ---- UI helpers ------------------------------------------------------------
@@ -130,6 +224,28 @@ function fmt(value) {
   if (value === undefined) return "undefined";
   if (typeof value === "string") return JSON.stringify(value);
   return String(value);
+}
+
+function findFrameLabel(frameId) {
+  const f = frameList.find((x) => x.frameId === frameId);
+  return f ? f.label : "frame#" + frameId;
+}
+
+// ---- Results rendering -----------------------------------------------------
+
+function mergeResultPayloads(arr) {
+  let total = 0;
+  let truncated = false;
+  const sample = [];
+  for (const { frameId, payload } of arr) {
+    if (!payload) continue;
+    total += payload.total || 0;
+    truncated = truncated || !!payload.truncated;
+    for (const r of payload.sample || []) {
+      sample.push({ ...r, frameId });
+    }
+  }
+  return { total, truncated, sample: sample.slice(0, 1000) };
 }
 
 function renderResults(payload) {
@@ -163,8 +279,10 @@ function renderResults(payload) {
 
     const path = document.createElement("span");
     path.className = "col-path";
-    path.title = r.pathStr;
-    path.textContent = r.pathStr;
+    const fid = r.frameId == null ? null : Number(r.frameId);
+    const label = fid != null ? findFrameLabel(fid) : "main";
+    path.title = "[" + label + "] " + r.pathStr;
+    path.textContent = (fid != null && fid !== 0 ? "[" + label + "] " : "") + r.pathStr;
 
     const value = document.createElement("span");
     value.className = "col-value";
@@ -217,21 +335,34 @@ function renderFrozen(list) {
     const row = document.createElement("div");
     row.className = "row-item" + (e.enabled ? "" : " disabled");
 
+    const fid = e.frameId == null ? 0 : Number(e.frameId);
+
     const name = document.createElement("span");
     name.className = "col-name";
     const nameInput = document.createElement("input");
     nameInput.className = "name-input";
     nameInput.value = e.name;
-    nameInput.title = e.path.join(" > ");
+    nameInput.title = (fid !== 0 ? "[" + findFrameLabel(fid) + "] " : "") + (e.path || []).join(" > ");
     nameInput.addEventListener("change", async () => {
       try {
-        const r = await call({ cmd: "freezeUpdate", freezeId: e.freezeId, name: nameInput.value });
-        if (r.ok) renderFrozen(r.list);
+        const r = await callFrame(fid, {
+          cmd: "freezeUpdate",
+          freezeId: e.freezeId,
+          name: nameInput.value,
+        });
+        if (r && r.ok) await refreshFrozen();
       } catch (err) {
         setStatus("Error: " + err.message, "err");
       }
     });
     name.appendChild(nameInput);
+    if (fid !== 0) {
+      const tag = document.createElement("div");
+      tag.className = "muted";
+      tag.style.fontSize = "10px";
+      tag.textContent = "▸ " + findFrameLabel(fid);
+      name.appendChild(tag);
+    }
 
     const value = document.createElement("span");
     value.className = "col-value";
@@ -240,13 +371,13 @@ function renderFrozen(list) {
     valInput.value = e.value == null ? "" : String(e.value);
     valInput.addEventListener("change", async () => {
       try {
-        const r = await call({
+        const r = await callFrame(fid, {
           cmd: "freezeUpdate",
           freezeId: e.freezeId,
           value: valInput.value,
         });
-        if (r.ok) renderFrozen(r.list);
-        else setStatus("Error: " + (r.error || "update failed"), "err");
+        if (r && r.ok) await refreshFrozen();
+        else setStatus("Error: " + ((r && r.error) || "update failed"), "err");
       } catch (err) {
         setStatus("Error: " + err.message, "err");
       }
@@ -268,12 +399,12 @@ function renderFrozen(list) {
     cb.checked = !!e.enabled;
     cb.addEventListener("change", async () => {
       try {
-        const r = await call({
+        const r = await callFrame(fid, {
           cmd: "freezeUpdate",
           freezeId: e.freezeId,
           enabled: cb.checked,
         });
-        if (r.ok) renderFrozen(r.list);
+        if (r && r.ok) await refreshFrozen();
       } catch (err) {
         setStatus("Error: " + err.message, "err");
       }
@@ -288,8 +419,8 @@ function renderFrozen(list) {
     rmBtn.textContent = "Remove";
     rmBtn.addEventListener("click", async () => {
       try {
-        const r = await call({ cmd: "freezeRemove", freezeId: e.freezeId });
-        if (r.ok) renderFrozen(r.list);
+        const r = await callFrame(fid, { cmd: "freezeRemove", freezeId: e.freezeId });
+        if (r && r.ok) await refreshFrozen();
       } catch (err) {
         setStatus("Error: " + err.message, "err");
       }
@@ -307,6 +438,23 @@ function renderFrozen(list) {
   els.frozen.appendChild(frag);
 }
 
+async function refreshFrozen() {
+  // Always aggregate frozen list across all frames so user sees everything.
+  try {
+    const arr = await callActive({ cmd: "freezeList" }, { fanout: true });
+    const merged = [];
+    for (const { frameId, payload } of arr) {
+      if (!payload || !payload.list) continue;
+      for (const e of payload.list) {
+        merged.push({ ...e, frameId });
+      }
+    }
+    renderFrozen(merged);
+  } catch (e) {
+    // ignore
+  }
+}
+
 // ---- Actions ---------------------------------------------------------------
 
 async function onFirstScan() {
@@ -317,13 +465,18 @@ async function onFirstScan() {
 
   setStatus("Scanning…");
   try {
-    const r = await call({ cmd: "firstScan", type, op, value, value2 });
-    if (r.error) {
-      setStatus("Error: " + r.error, "err");
+    const arr = await callActive({ cmd: "firstScan", type, op, value, value2 });
+    const errs = arr.filter((x) => x.payload && x.payload.error);
+    if (errs.length && arr.length === errs.length) {
+      setStatus("Error: " + errs[0].payload.error, "err");
       return;
     }
-    setStatus("Found " + r.total + " result(s)", "ok");
-    renderResults(r);
+    const merged = mergeResultPayloads(arr);
+    setStatus(
+      "Found " + merged.total + " result(s) across " + arr.length + " frame(s)",
+      "ok"
+    );
+    renderResults(merged);
   } catch (err) {
     setStatus("Error: " + err.message, "err");
   }
@@ -336,13 +489,10 @@ async function onNextScan() {
 
   setStatus("Filtering…");
   try {
-    const r = await call({ cmd: "nextScan", op, value, value2 });
-    if (r.error) {
-      setStatus("Error: " + r.error, "err");
-      return;
-    }
-    setStatus(r.total + " match(es) remain", "ok");
-    renderResults(r);
+    const arr = await callActive({ cmd: "nextScan", op, value, value2 });
+    const merged = mergeResultPayloads(arr);
+    setStatus(merged.total + " match(es) remain", "ok");
+    renderResults(merged);
   } catch (err) {
     setStatus("Error: " + err.message, "err");
   }
@@ -351,8 +501,8 @@ async function onNextScan() {
 async function onNewScan() {
   setStatus("Cleared", "ok");
   try {
-    const r = await call({ cmd: "newScan" });
-    renderResults(r);
+    await callActive({ cmd: "newScan" }, { fanout: true });
+    renderResults({ total: 0, sample: [], truncated: false });
   } catch (err) {
     setStatus("Error: " + err.message, "err");
   }
@@ -360,10 +510,10 @@ async function onNewScan() {
 
 async function onRefresh() {
   try {
-    const r = await call({ cmd: "refresh" });
-    renderResults(r);
-    const fr = await call({ cmd: "freezeList" });
-    if (fr && fr.ok) renderFrozen(fr.list);
+    await refreshFrames();
+    const arr = await callActive({ cmd: "refresh" });
+    renderResults(mergeResultPayloads(arr));
+    await refreshFrozen();
   } catch (err) {
     setStatus("Error: " + err.message, "err");
   }
@@ -373,7 +523,13 @@ async function onEdit(r) {
   const next = window.prompt("New value for " + r.pathStr, String(r.value));
   if (next == null) return;
   try {
-    const resp = await call({ cmd: "write", path: r.path, type: r.type, value: next });
+    const fid = r.frameId == null ? 0 : Number(r.frameId);
+    const resp = await callFrame(fid, {
+      cmd: "write",
+      path: r.path,
+      type: r.type,
+      value: next,
+    });
     if (!resp.ok) {
       setStatus("Write failed: " + (resp.error || "unknown"), "err");
       return;
@@ -389,10 +545,11 @@ async function onFreeze(r) {
   const name = window.prompt(
     "Name for this saved value:",
     r.pathStr.replace(/^window\./, "")
-  ) ;
+  );
   if (name == null) return;
   try {
-    const resp = await call({
+    const fid = r.frameId == null ? 0 : Number(r.frameId);
+    const resp = await callFrame(fid, {
       cmd: "freezeAdd",
       path: r.path,
       type: r.type,
@@ -403,7 +560,7 @@ async function onFreeze(r) {
       setStatus("Freeze failed: " + (resp.error || "unknown"), "err");
       return;
     }
-    renderFrozen(resp.list);
+    await refreshFrozen();
     setStatus("Frozen", "ok");
   } catch (err) {
     setStatus("Error: " + err.message, "err");
@@ -420,8 +577,17 @@ async function init() {
   els.btnNext.addEventListener("click", onNextScan);
   els.btnNew.addEventListener("click", onNewScan);
   els.btnRefresh.addEventListener("click", onRefresh);
+  els.btnFramesRefresh.addEventListener("click", async () => {
+    await refreshFrames();
+    setStatus("Frames refreshed (" + frameList.length + ")", "ok");
+  });
 
-  // Track active tab so we always talk to whatever the user is looking at.
+  els.frame.addEventListener("change", () => {
+    const v = els.frame.value;
+    activeFrame = v === ALL ? ALL : Number(v);
+  });
+
+  // Track active tab.
   const tab = await getActiveTab();
   if (tab) activeTabId = tab.id;
 
@@ -434,18 +600,38 @@ async function init() {
     if (tabId === activeTabId && info.status === "complete") attach();
   });
 
+  // React to new frames being created in our tab so dynamically inserted
+  // iframes (e.g. WebGL game frame added 3 minutes after page load) show up.
+  if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
+    chrome.webNavigation.onCommitted.addListener((details) => {
+      if (details.tabId !== activeTabId) return;
+      setTimeout(refreshFrames, 250);
+    });
+  }
+  if (chrome.webNavigation && chrome.webNavigation.onCompleted) {
+    chrome.webNavigation.onCompleted.addListener((details) => {
+      if (details.tabId !== activeTabId) return;
+      setTimeout(refreshFrames, 250);
+    });
+  }
+
   await attach();
 
-  // Periodically refresh the frozen list so "Current" column is live.
+  // Periodic light refresh of the frozen list's "Current" column.
   refreshTimer = setInterval(async () => {
     if (document.hidden) return;
     try {
-      const fr = await call({ cmd: "freezeList" });
-      if (fr && fr.ok) renderFrozen(fr.list);
+      await refreshFrozen();
     } catch (e) {
-      // tab might be gone or not injectable
+      /* ignore */
     }
   }, 800);
+
+  // Safety net — re-fetch frame list every few seconds.
+  framesRefreshTimer = setInterval(() => {
+    if (document.hidden) return;
+    refreshFrames();
+  }, 3000);
 }
 
 async function attach() {
@@ -454,18 +640,16 @@ async function attach() {
     return;
   }
   try {
-    const ok = await ensureContentScript(activeTabId);
-    if (!ok) {
-      setStatus("Cannot attach to this page", "err");
-      return;
-    }
-    setStatus("Attached", "ok");
-    // Pull existing frozen list (state lives in the page).
-    const fr = await call({ cmd: "freezeList" });
-    if (fr && fr.ok) renderFrozen(fr.list);
-    // Also refresh results in case the page already had a scan.
-    const rr = await call({ cmd: "refresh" });
-    renderResults(rr);
+    await refreshFrames();
+    const ok = await ensureFrameAttached(activeTabId, 0);
+    setStatus(
+      ok ? "Attached (" + frameList.length + " frame(s))" : "Cannot attach to this page",
+      ok ? "ok" : "err"
+    );
+    if (!ok) return;
+    await refreshFrozen();
+    const arr = await callActive({ cmd: "refresh" });
+    renderResults(mergeResultPayloads(arr));
   } catch (err) {
     setStatus("Error: " + err.message, "err");
   }

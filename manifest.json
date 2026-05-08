@@ -3,7 +3,7 @@
   "name": "Web Cheat Engine",
   "version": "1.0.0",
   "description": "Search, edit and freeze JavaScript values in the current page (Int, Float, Double, Dword, String and more) — like Cheat Engine for the browser.",
-  "permissions": ["activeTab", "scripting", "sidePanel", "storage", "tabs"],
+  "permissions": ["activeTab", "scripting", "sidePanel", "storage", "tabs", "webNavigation"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"
@@ -31,7 +31,9 @@
       "matches": ["<all_urls>"],
       "js": ["content.js"],
       "run_at": "document_start",
-      "all_frames": false
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true
     }
   ],
   "web_accessible_resources": [
