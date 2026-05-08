@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Web Cheat Engine</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="title">
+        <span class="logo">CE</span>
+        <span>Web Cheat Engine</span>
+      </div>
+      <div id="status" class="status">attaching…</div>
+    </header>
+
+    <section class="panel">
+      <div class="row">
+        <label class="grow">
+          Frame
+          <select id="frame">
+            <option value="all">All frames</option>
+          </select>
+        </label>
+        <button id="btn-frames-refresh" class="ghost tiny" title="Re-scan frames">↻</button>
+      </div>
+      <div class="row">
+        <label>
+          Type
+          <select id="type">
+            <option value="dword">Dword (4 bytes int)</option>
+            <option value="byte">Byte</option>
+            <option value="word">Word (2 bytes int)</option>
+            <option value="qword">Qword (BigInt / large int)</option>
+            <option value="int">Integer (any size)</option>
+            <option value="float">Float</option>
+            <option value="double">Double</option>
+            <option value="anynumber">Any Number</option>
+            <option value="string">String</option>
+            <option value="boolean">Boolean</option>
+          </select>
+        </label>
+        <label>
+          Compare
+          <select id="op">
+            <option value="eq">Equal to</option>
+            <option value="ne">Not equal to</option>
+            <option value="gt">Greater than</option>
+            <option value="lt">Less than</option>
+            <option value="ge">Greater or equal</option>
+            <option value="le">Less or equal</option>
+            <option value="between">Between</option>
+            <option value="increased">Increased</option>
+            <option value="decreased">Decreased</option>
+            <option value="changed">Changed</option>
+            <option value="unchanged">Unchanged</option>
+            <option value="increased_by">Increased by</option>
+            <option value="decreased_by">Decreased by</option>
+            <option value="unknown">Unknown initial value</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label class="grow">
+          Value
+          <input id="value" type="text" placeholder="e.g. 100" />
+        </label>
+        <label class="grow" id="value2-wrap" style="display: none">
+          And
+          <input id="value2" type="text" placeholder="e.g. 200" />
+        </label>
+      </div>
+      <div class="row buttons">
+        <button id="btn-first" class="primary">First Scan</button>
+        <button id="btn-next">Next Scan</button>
+        <button id="btn-new" class="ghost">New Scan</button>
+        <button id="btn-refresh" class="ghost">Refresh</button>
+      </div>
+    </section>
+
+    <section class="panel results">
+      <div class="section-title">
+        <span>Results</span>
+        <span id="results-count" class="muted">0</span>
+      </div>
+      <div class="results-head">
+        <span class="col-path">Path</span>
+        <span class="col-value">Value</span>
+        <span class="col-type">Type</span>
+        <span class="col-actions">Actions</span>
+      </div>
+      <div id="results" class="results-list" role="listbox" aria-label="Scan results"></div>
+      <div id="results-truncated" class="muted" style="display: none">
+        Showing first 1000 results — narrow your scan to see more.
+      </div>
+    </section>
+
+    <section class="panel frozen">
+      <div class="section-title">
+        <span>Frozen / Saved values</span>
+        <span id="frozen-count" class="muted">0</span>
+      </div>
+      <div class="frozen-head">
+        <span class="col-name">Name</span>
+        <span class="col-value">Frozen value</span>
+        <span class="col-current">Current</span>
+        <span class="col-actions">Actions</span>
+      </div>
+      <div id="frozen" class="frozen-list"></div>
+    </section>
+
+    <footer class="footer">
+      <span class="muted">
+        Reachable JS values from <code>window</code> are scanned. Numbers in JS are
+        IEEE-754 doubles, so Byte/Word/Dword are filtered by integer range.
+      </span>
+    </footer>
+
+    <script src="sidepanel.js"></script>
+  </body>
+</html>
