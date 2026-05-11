@@ -1,17 +1,36 @@
 // Kogama Account Switcher — content script
 //
-// Watches the Kogama page for the profile dropdown opening, then injects
-// two extra menu entries:
+// Watches the Kogama page for the profile drawer opening, then injects
+// two extra entries:
 //   * "Сменить аккаунт" — opens an in-page modal with saved accounts.
 //   * "Тихий выход" — clears all cookies and reloads the page.
+//
+// The Kogama profile menu is a MUI Drawer that is mounted to the body
+// whenever the menu opens. Its content has this structure (class names
+// reflect the current Kogama build):
+//
+//   div._38CK4                  // drawer content
+//     div._1sKv_                // header (avatar / name / xp / gold)
+//     div._2D2wg                // nav wrapper
+//       hr.MuiDivider-root
+//       ul (Обновить профиль, Друзья, Заблокированные пользователи)
+//       hr.MuiDivider-root
+//       ul (Buy Gold, Обновиться до Elite)
+//       hr.MuiDivider-root
+//       div._18Ml_              // footer links
+//     div._1gJbZ                // logout wrapper
+//       button#logout-link-handle  // "Выйти"
+//
+// We anchor everything off `#logout-link-handle` because the id is the
+// most stable selector across builds.
 
 (() => {
-  const MENU_ANCHOR_TEXTS = ["Обновить профиль", "Update Profile"];
-  const LOGOUT_TEXTS = ["Выйти", "Logout", "Log out", "Sign Out"];
   const INJECT_MARKER = "data-kas-injected";
 
   const SWITCH_LABEL = "Сменить аккаунт";
   const SILENT_LOGOUT_LABEL = "Тихий выход";
+  const SWITCH_MARKER = "data-kas-switch-item";
+  const SILENT_MARKER = "data-kas-silent-button";
 
   const messageBackground = (payload) =>
     new Promise((resolve, reject) => {
@@ -36,145 +55,152 @@
       }
     });
 
-  function findMenuRoot() {
-    // The Kogama profile dropdown contains the "Обновить профиль" entry. We
-    // walk up from that node to the nearest container that also holds the
-    // logout button, so we know we're operating on the popover and not the
-    // surrounding page.
-    const anchors = [];
-    for (const text of MENU_ANCHOR_TEXTS) {
-      const xpath = document.evaluate(
-        `//*[normalize-space(text())="${text}"]`,
-        document,
-        null,
-        XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
-        null
-      );
-      for (let i = 0; i < xpath.snapshotLength; i += 1) {
-        anchors.push(xpath.snapshotItem(i));
+  // ---------------- Menu injection ----------------
+
+  function findDrawerContent() {
+    const logoutButton = document.getElementById("logout-link-handle");
+    if (!logoutButton) return null;
+    const logoutWrap = logoutButton.parentElement; // div._1gJbZ
+    if (!logoutWrap) return null;
+    const drawerContent = logoutWrap.parentElement; // div._38CK4
+    if (!drawerContent) return null;
+
+    let navWrap = null;
+    for (const child of drawerContent.children) {
+      if (child !== logoutWrap && child.querySelector("ul")) {
+        navWrap = child;
+        break;
       }
     }
-    for (const anchor of anchors) {
-      let node = anchor;
-      while (node && node !== document.body) {
-        if (containsLogoutText(node)) {
-          return { container: node, profileAnchor: anchor };
-        }
-        node = node.parentElement;
-      }
+    if (!navWrap) return null;
+    return { drawerContent, navWrap, logoutWrap, logoutButton };
+  }
+
+  function buildSwitchItem(templateLi) {
+    const li = templateLi.cloneNode(true);
+    li.setAttribute(SWITCH_MARKER, "1");
+
+    // Strip any existing href / click handlers from cloned <a>/<button>.
+    const clickable = li.querySelector("a, button");
+    if (clickable) {
+      // Replace with a fresh <button> so React can't reattach old handlers.
+      const replacement = document.createElement("button");
+      replacement.type = "button";
+      replacement.className = clickable.className;
+      replacement.textContent = SWITCH_LABEL;
+      clickable.parentNode.replaceChild(replacement, clickable);
+    } else {
+      const textContainer = li.querySelector(".MuiListItemText-primary, span");
+      if (textContainer) textContainer.textContent = SWITCH_LABEL;
     }
-    return null;
-  }
 
-  function containsLogoutText(node) {
-    if (!node || !node.textContent) return false;
-    const text = node.textContent;
-    return LOGOUT_TEXTS.some((label) =>
-      new RegExp(`(^|[^\\p{L}])${escapeRegExp(label)}([^\\p{L}]|$)`, "u").test(
-        text
-      )
-    );
-  }
-
-  function escapeRegExp(value) {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-
-  function findLogoutClickable(container) {
-    const candidates = container.querySelectorAll(
-      "a, button, [role='button'], [role='menuitem'], div, span"
-    );
-    for (const el of candidates) {
-      const text = (el.textContent || "").trim();
-      if (!text) continue;
-      if (LOGOUT_TEXTS.some((label) => text === label)) {
-        return el.closest("a, button, [role='menuitem'], [role='button']") || el;
-      }
+    // Swap the icon to a "switch arrows" SVG.
+    const iconHost = li.querySelector(".MuiListItemIcon-root");
+    if (iconHost) {
+      iconHost.innerHTML =
+        '<svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 512 512" height="1em" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M280 168c0-13.3 10.7-24 24-24h132.1l-30.1-30.1c-9.4-9.4-9.4-24.6 0-33.9 9.4-9.4 24.6-9.4 33.9 0l71 71c9.4 9.4 9.4 24.6 0 33.9l-71 71c-9.4 9.4-24.6 9.4-33.9 0s-9.4-24.6 0-33.9L436.1 192H304c-13.3 0-24-10.7-24-24zM232 344c0 13.3-10.7 24-24 24H75.9l30.1 30.1c9.4 9.4 9.4 24.6 0 33.9-9.4 9.4-24.6 9.4-33.9 0l-71-71c-9.4-9.4-9.4-24.6 0-33.9l71-71c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9L75.9 320H208c13.3 0 24 10.7 24 24z"/></svg>';
     }
-    return null;
-  }
 
-  function findClickableForAnchor(anchor) {
-    return (
-      anchor.closest(
-        "a, button, [role='menuitem'], [role='button']"
-      ) || anchor
-    );
-  }
-
-  function buildMenuItem({ label, icon, onClick, modifier }) {
-    const item = document.createElement("button");
-    item.type = "button";
-    item.className = `kas-menu-item${modifier ? ` kas-menu-item--${modifier}` : ""}`;
-    item.setAttribute("role", "menuitem");
-    item.innerHTML = `
-      <span class="kas-menu-item__icon" aria-hidden="true">${icon}</span>
-      <span class="kas-menu-item__label"></span>
-    `;
-    item.querySelector(".kas-menu-item__label").textContent = label;
-    item.addEventListener("click", (event) => {
+    li.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      onClick(event);
+      closeKogamaDrawer();
+      openSwitcherModal();
     });
-    return item;
-  }
 
-  function injectMenuItems(menuInfo) {
-    const { container, profileAnchor } = menuInfo;
-    if (container.getAttribute(INJECT_MARKER) === "1") return;
-    container.setAttribute(INJECT_MARKER, "1");
-
-    const profileItem = findClickableForAnchor(profileAnchor);
-    const logoutItem = findLogoutClickable(container);
-
-    const switchButton = buildMenuItem({
-      label: SWITCH_LABEL,
-      modifier: "switch",
-      icon:
-        '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M21 3l-7 7"/><path d="M8 21H3v-5"/><path d="M3 21l7-7"/></svg>',
-      onClick: () => {
-        closeKogamaMenu();
+    // Also bind on the inner button so keyboard activation works.
+    const button = li.querySelector("button, a");
+    if (button) {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        closeKogamaDrawer();
         openSwitcherModal();
-      },
-    });
-
-    const silentLogoutButton = buildMenuItem({
-      label: SILENT_LOGOUT_LABEL,
-      modifier: "silent",
-      icon:
-        '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/><path d="M12 19a7 7 0 1 1 0-14"/></svg>',
-      onClick: async () => {
-        closeKogamaMenu();
-        try {
-          await messageBackground({ type: "kas:silent-logout" });
-          showToast("Cookies очищены. Перезагрузка…");
-          setTimeout(() => window.location.reload(), 400);
-        } catch (err) {
-          showToast(`Ошибка тихого выхода: ${err.message}`, "error");
-        }
-      },
-    });
-
-    if (profileItem && profileItem.parentElement) {
-      profileItem.parentElement.insertBefore(switchButton, profileItem);
-    } else {
-      container.appendChild(switchButton);
+      });
     }
-    if (logoutItem && logoutItem.parentElement) {
-      logoutItem.parentElement.insertBefore(
-        silentLogoutButton,
-        logoutItem.nextSibling
-      );
-    } else {
-      container.appendChild(silentLogoutButton);
-    }
+
+    return li;
   }
 
-  function closeKogamaMenu() {
-    // Click somewhere safe to dismiss the native popover so it doesn't
-    // overlap with our modal.
-    document.body.click();
+  function buildSilentLogoutButton(templateButton) {
+    const button = templateButton.cloneNode(true);
+    button.removeAttribute("id");
+    button.setAttribute(SILENT_MARKER, "1");
+
+    // Find/replace the text node "Выйти" with our label.
+    let replaced = false;
+    for (const child of Array.from(button.childNodes)) {
+      if (
+        child.nodeType === Node.TEXT_NODE &&
+        child.textContent.trim().length > 0
+      ) {
+        child.textContent = SILENT_LOGOUT_LABEL;
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) button.textContent = SILENT_LOGOUT_LABEL;
+
+    // Swap the start icon to a "broom"/"clear cookies" SVG.
+    const iconHost = button.querySelector(".MuiButton-startIcon");
+    if (iconHost) {
+      iconHost.innerHTML =
+        '<svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 512 512" height="1em" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M256.5 216.8c89.3 0 161.7 41.5 161.7 92.6 0 51.2-72.4 92.6-161.7 92.6S94.8 360.6 94.8 309.5c0-51.2 72.4-92.7 161.7-92.7M256 0c-37.5 0-71.4 13.5-94.7 35.7l50.1 50c12.5-3.7 27.3-5.7 43.5-5.7 16.2 0 30.9 2 43.5 5.7l50.1-50C328.4 13.5 294.5 0 256 0zM118.5 124.6L67.7 124.5 78 197.8l43.5-44.1 27.3 27.3c-21.9 24.2-35 53.7-35 86 0 76.8 73.7 138.7 165 138.7s165-62 165-138.7c0-32.4-13.1-61.8-35.1-86.1l27.3-27.3 43.5 44.1 10.3-73.3-50.8.1c-24.7-23.7-58.9-39.8-97.3-44.7zM160 432c-26.5 0-48 21.5-48 48s21.5 48 48 48 48-21.5 48-48-21.5-48-48-48zm192 0c-26.5 0-48 21.5-48 48s21.5 48 48 48 48-21.5 48-48-21.5-48-48-48z"/></svg>';
+    }
+
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      button.disabled = true;
+      try {
+        await messageBackground({ type: "kas:silent-logout" });
+        showToast("Cookies очищены. Перезагрузка…");
+        setTimeout(() => window.location.reload(), 400);
+      } catch (err) {
+        showToast(`Ошибка тихого выхода: ${err.message}`, "error");
+        button.disabled = false;
+      }
+    });
+
+    return button;
+  }
+
+  function injectMenuItems(parts) {
+    const { drawerContent, navWrap, logoutWrap, logoutButton } = parts;
+    if (drawerContent.getAttribute(INJECT_MARKER) === "1") {
+      return;
+    }
+    drawerContent.setAttribute(INJECT_MARKER, "1");
+
+    // Pick the first <li> from the first <ul> as a template for our menu
+    // item — clone its DOM so it picks up MUI's hashed class names
+    // automatically. Same for the logout button.
+    const firstUl = navWrap.querySelector("ul");
+    const templateLi = firstUl ? firstUl.querySelector("li") : null;
+    if (templateLi && firstUl) {
+      const switchItem = buildSwitchItem(templateLi);
+      // Insert "Сменить аккаунт" at the top of the first list, so it sits
+      // right next to "Обновить профиль" exactly where the user asked.
+      firstUl.insertBefore(switchItem, firstUl.firstChild);
+    }
+
+    const silentButton = buildSilentLogoutButton(logoutButton);
+    logoutWrap.appendChild(silentButton);
+  }
+
+  function closeKogamaDrawer() {
+    // The drawer is dismissed by clicking the backdrop (.MuiBackdrop-root).
+    const backdrop = document.querySelector(
+      ".MuiModal-root .MuiBackdrop-root"
+    );
+    if (backdrop instanceof HTMLElement) {
+      backdrop.click();
+      return;
+    }
+    // Fallback: dispatch Escape on body.
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true })
+    );
   }
 
   // ---------------- Modal ----------------
@@ -185,6 +211,7 @@
     if (modalRoot) return modalRoot;
     modalRoot = document.createElement("div");
     modalRoot.id = "kas-modal-root";
+    modalRoot.hidden = true;
     modalRoot.innerHTML = `
       <div class="kas-backdrop" data-kas-close="1"></div>
       <div class="kas-dialog" role="dialog" aria-modal="true" aria-labelledby="kas-title">
@@ -401,7 +428,6 @@
     card.appendChild(switchBtn);
     card.appendChild(removeBtn);
 
-    card.addEventListener("click", () => handleSwitch(account, switchBtn));
     return card;
   }
 
@@ -455,16 +481,25 @@
   }
 
   // ---------------- Observer ----------------
-  const observer = new MutationObserver(() => {
-    const menuInfo = findMenuRoot();
-    if (menuInfo) injectMenuItems(menuInfo);
-  });
+  function tryInject() {
+    const parts = findDrawerContent();
+    if (parts) {
+      try {
+        injectMenuItems(parts);
+      } catch (err) {
+        console.error("[Kogama Account Switcher] inject failed:", err);
+      }
+    }
+  }
+
+  const observer = new MutationObserver(tryInject);
   observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
   });
 
   // Initial pass in case the menu is already open on load.
-  const initial = findMenuRoot();
-  if (initial) injectMenuItems(initial);
+  tryInject();
+
+  console.info("[Kogama Account Switcher] content script loaded");
 })();
